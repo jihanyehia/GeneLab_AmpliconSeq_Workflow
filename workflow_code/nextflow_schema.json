@@ -217,6 +217,60 @@
                 }
             }
         },
+        "test_mode_options": {
+            "title": "Test mode options",
+            "type": "object",
+            "description": "Parameters controlling the workflow's test-mode execution path and grid search behavior.",
+            "default": "",
+            "properties": {
+                "test_mode": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Enable test mode. When true, the workflow stops after test mode and produces only the test report."
+                },
+                "test_level": {
+                    "type": "string",
+                    "default": "full",
+                    "description": "Depth of test mode execution.",
+                    "enum": ["primers", "filter", "full"]
+                },
+                "test_n_samples": {
+                    "type": "integer",
+                    "default": 3,
+                    "description": "Number of samples selected for test mode when --input_file is not provided."
+                },
+                "test_primer_nreads": {
+                    "type": "integer",
+                    "default": 10000,
+                    "description": "Number of reads inspected per sample for primer detection in test mode."
+                },
+                "test_primer_threshold": {
+                    "type": "number",
+                    "default": 50.0,
+                    "description": "Minimum mean F_primer percentage on R1/single-end reads required to call primers present."
+                },
+                "test_trunc_left": {
+                    "type": "string",
+                    "default": "0,230,220",
+                    "description": "Comma-separated left truncLen values for the test-mode filter grid."
+                },
+                "test_trunc_right": {
+                    "type": "string",
+                    "default": "0,200,190",
+                    "description": "Comma-separated right truncLen values for the test-mode filter grid."
+                },
+                "test_maxEE_left": {
+                    "type": "string",
+                    "default": "1,2",
+                    "description": "Comma-separated left maxEE values for the test-mode filter grid."
+                },
+                "test_maxEE_right": {
+                    "type": "string",
+                    "default": "1,2",
+                    "description": "Comma-separated right maxEE values for the test-mode filter grid."
+                }
+            }
+        },
         "general_pipeline_settings": {
             "title": "General Pipeline Settings",
             "type": "object",
@@ -325,6 +379,9 @@
         },
         {
             "$ref": "#/$defs/debugging_options"
+        },
+        {
+            "$ref": "#/$defs/test_mode_options"
         },
         {
             "$ref": "#/$defs/general_pipeline_settings"

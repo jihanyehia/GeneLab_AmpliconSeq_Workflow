@@ -42,7 +42,8 @@ The table below details the default maximum resource allocations for individual 
    4a. [Approach 1: Start with OSD or GLDS accession as input](#4a-approach-1-start-with-an-osd-or-glds-accession-as-input)  
    4b. [Approach 2: Start with a runsheet csv file as input](#4b-approach-2-start-with-a-runsheet-csv-file-as-input)  
    4c. [Approach 3: Run the workflow using an ISA Archive](#4c-approach-3-run-the-workflow-using-an-isa-archive)  
-   4d. [Modify parameters and compute resources in the Nextflow config file](#4c-modify-parameters-and-compute-resources-in-the-nextflow-config-file)  
+   4d. [Modify parameters and compute resources in the Nextflow config file](#4d-modify-parameters-and-compute-resources-in-the-nextflow-config-file)  
+   4e. [Run the workflow in test mode](#4e-run-the-workflow-in-test-mode)  
 
 5. [Workflow Outputs](#5-workflow-outputs)  
    5a. [Main outputs](#5a-main-outputs)  
@@ -256,6 +257,47 @@ See `nextflow run -h` and [Nextflow's CLI run command documentation](https://nex
 Additionally, all parameters and workflow resources can be directly specified in the [nextflow.config](./workflow_code/nextflow.config) file. For detailed instructions on how to modify and set parameters in the config file, please see the [documentation here](https://www.nextflow.io/docs/latest/config.html).
 
 Once you've downloaded the workflow template, you can modify the parameters in the `params` scope and cpus/memory requirements in the `process` scope in your downloaded version of the [nextflow.config](workflow_code/nextflow.config) file as needed in order to match your dataset and system setup. Additionally, if necessary, you can modify each variable in the [nextflow.config](workflow_code/nextflow.config) file to be consistent with the study you want to process and the computer you're using for processing.
+
+<br>
+
+#### 4e. Run the workflow in test mode
+
+Test mode is intended for rapid parameter assessment before running the full production pipeline. The workflow always stages inputs and runs raw read QC (FastQC + MultiQC) first; when `--test_mode` is enabled, it then branches to the selected test-mode checks, and generates an HTML summary report based on the results of the checks.
+
+Run test mode by adding `--test_mode` to a normal workflow command:
+
+```bash
+nextflow run main.nf \
+   -resume \
+   -profile singularity \
+   --target_region 16S \
+   --accession OSD-487 \
+   --test_mode
+```
+
+Use `--test_level` to control which checks are run:
+
+* `--test_level primers` - Runs primer presence checks and a cutadapt anchor/link/discard combination scan
+* `--test_level filter` - Runs a DADA2 `filterAndTrim` grid search across truncLen and maxEE combinations
+* `--test_level full` - Runs both checks sequentially (default)
+
+By default, test mode stages the full dataset and selects representative samples automatically.
+
+* `--test_n_samples` - Number of representative samples to select when using accession/ISA-based inputs (default: 3)
+
+When `--input_file` is provided, test mode runs directly on samples in that runsheet and does not perform automatic sample selection.
+
+> Note: `--limit_samples_to` is ignored when `--test_mode` is enabled.
+
+Test mode output is written to:
+
+* `Test_Mode_Report/test_mode_report.html`
+
+Additional test-mode parameters (including primer-read sampling and optional truncLen/maxEE grid controls) are available in [nextflow.config](workflow_code/nextflow.config) and can be viewed via:
+
+```bash
+nextflow run main.nf --help
+```
 
 <br>
 
