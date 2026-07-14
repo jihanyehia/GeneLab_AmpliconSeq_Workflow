@@ -61,6 +61,15 @@ log.info """${c_blue}
          Limit Samples for Testing: ${params.limit_samples_to}
          Force Processing Single-End: ${params.force_single_end}
 
+         Test Mode:
+         Test Mode Active: ${params.test_mode}
+         Test Level: ${params.test_level}
+         Test Primer n-reads: ${params.test_primer_nreads}
+         Test truncLen left: ${params.test_trunc_left}
+         Test truncLen right: ${params.test_trunc_right}
+         Test maxEE left: ${params.test_maxEE_left}
+         Test maxEE right: ${params.test_maxEE_right}
+
          General Pipeline Settings:
          Nextflow Directory publishing mode: ${params.publish_dir_mode}
          MultiQC configuration file: ${params.multiqc_config}
@@ -84,25 +93,11 @@ include { STAGE_ANALYSIS } from './subworkflows/stage_analysis.nf'
 // Read quality check and filtering
 include { FASTQC as RAW_FASTQC ; MULTIQC as RAW_MULTIQC  } from './modules/quality_assessment.nf'
 
-// Trim primers if requested
-include { CUTADAPT ; COMBINE_CUTADAPT_LOGS_AND_SUMMARIZE } from './modules/cutadapt.nf'
+// Test mode subworkflow
+include { TEST_MODE } from './subworkflows/test_mode.nf'
 
-// Cluster ASVs
-include { DOWNLOAD_DATABASE } from './modules/download_database.nf'
-include { RUN_DADA2 } from './modules/run_dada.nf'
-
-// Filtered quality check
-include { FASTQC as FILTERED_FASTQC ; MULTIQC as FILTERED_MULTIQC  } from './modules/quality_assessment.nf'
-
-// Diversity, differential abundance and visualizations
-include { ALPHA_DIVERSITY; BETA_DIVERSITY } from './modules/diversity.nf'
-include { PLOT_TAXONOMY } from './modules/taxonomy_plots.nf'
-include { ZIP as ZIP_BIOM; ZIP as ZIP_ALPHA; ZIP as ZIP_BETA_EUCLIDEAN; ZIP as ZIP_BETA_BRAY; ZIP as ZIP_TAXONOMY_SAMPLES; ZIP as ZIP_TAXONOMY_GROUPS } from './modules/zip.nf'
-include { ANCOMBC as ANCOMBC1 } from './modules/ancombc.nf'
-include { ANCOMBC as ANCOMBC2 } from './modules/ancombc.nf'
-include { DESEQ } from './modules/deseq.nf'
-include { ZIP as ZIP_DA; ZIP as ZIP_ANCOMBC1; ZIP as ZIP_ANCOMBC2; ZIP as ZIP_DESEQ2 } from './modules/zip.nf'
-include { SOFTWARE_VERSIONS } from './modules/utils.nf'
+// Production mode subworkflow
+include { PRODUCTION_MODE } from './subworkflows/production_mode.nf'
 
 ch_dp_tools_plugin = params.dp_tools_plugin ? channel.value(file(params.dp_tools_plugin)) : channel.value(file("$projectDir/bin/dp_tools__NF_AmpIllumina_${params.target_region}"))
 
@@ -115,7 +110,6 @@ def deleteWS(string){
     return string.replaceAll(/\s+/, '').toLowerCase()
 
 }
-
 
 workflow {
     main:
@@ -150,6 +144,38 @@ workflow {
             for the ISA-to-runsheet conversion.${c_reset}"""
     }
 
+    // Test mode sanity check
+    if (params.test_mode) {
+        def valid_levels = ['primers', 'filter', 'full']
+        if (!(params.test_level in valid_levels)) {
+            error("""${c_back_bright_red}TEST MODE ERROR!
+                  --test_level must be one of: primers, filter, full
+                  Got: ${params.test_level}
+                  ${c_reset}""")
+        }
+
+        if (params.limit_samples_to) {
+            log.warn """${c_back_bright_red}TEST MODE WARNING!
+                  --limit_samples_to is set but test mode stages the full dataset
+                  and selects representative samples automatically via quality ranking.
+                  limit_samples_to will be IGNORED in test mode.${c_reset}"""
+        }
+
+        if (params.input_file) {
+            log.info """${c_bright_green}
+            TEST MODE ACTIVE  —  level: ${params.test_level}
+            Runs test mode on samples provided in ${params.input_file}, 
+            ignoring automatic sample selection and quality ranking.
+         ${c_reset}"""
+        }
+        else {
+            log.info """${c_bright_green}
+            TEST MODE ACTIVE  —  level: ${params.test_level}
+            Stages full dataset, selects ${String.valueOf(params.test_n_samples ?: 3)} representative samples to run test mode on.
+         ${c_reset}"""
+        }
+    }
+
     software_versions_ch = channel.empty()
         
     // Stage analysis setup (inputs, and raw reads)
@@ -181,411 +207,81 @@ workflow {
     RAW_FASTQC.out.version | mix(software_versions_ch) | set{software_versions_ch}
     RAW_MULTIQC.out.version | mix(software_versions_ch) | set{software_versions_ch}
 
-    // Download reference database for taxonomic classification
-    def db_config = [
-            "16S": ["SILVA_SSU_r138_2_v2.RData", "https://api.figshare.com/v2/file/download/64078939"],
-            "ITS": ["UNITE_v2025.RData", "https://api.figshare.com/v2/file/download/64079011"],
-            "18S": ["PR2_v4_13_March2021.RData", "https://api.figshare.com/v2/file/download/46241917"]
-        ]
-    target_region_ch = Channel.value(params.target_region)
-        .map { region -> tuple(region, db_config[region][0], db_config[region][1]) }
-    
-    DOWNLOAD_DATABASE(target_region_ch)
+    // ─────────────────────────────────────────────────────────────────────────
+    // TEST MODE or FULL PIPELINE ROUTING
+    // ─────────────────────────────────────────────────────────────────────────
+    test_results = params.test_mode ?
+        TEST_MODE(staged_reads_ch, runsheet_ch, RAW_MULTIQC.out.data, primers_ch) :
+        null
 
-    trimmed_reads_ch = channel.empty()
-    trimmed_reads_counts = channel.empty()
-    cutadapt_logs = channel.empty()
-    if(params.trim_primers){
+    full_results = !params.test_mode ?
+        PRODUCTION_MODE(staged_reads_ch, runsheet_ch, isa_archive_ch, gl_file_ch, 
+                         primers_ch, software_versions_ch) :
+        null
 
-        //if(!params.accession) primers_ch = channel.value([params.F_primer, params.R_primer]) // to be removed once stage analysis workflow is implemented
-        CUTADAPT(staged_reads_ch, primers_ch)
-        logs = CUTADAPT.out.logs.map{ sample_id, log -> file("${log}")}.collect()
-        counts = CUTADAPT.out.trim_counts.map{ sample_id, count -> file("${count}")}.collect()
-        trimmed_reads_ch = CUTADAPT.out.reads.map{ 
-                                              sample_id, reads, isPaired -> reads instanceof List ? reads.each{file("${it}")}: file("${reads}")
-                                              }.flatten().collect()
-
-        COMBINE_CUTADAPT_LOGS_AND_SUMMARIZE(counts, logs, runsheet_ch)
-        trimmed_reads_counts = COMBINE_CUTADAPT_LOGS_AND_SUMMARIZE.out.counts
-        cutadapt_logs = COMBINE_CUTADAPT_LOGS_AND_SUMMARIZE.out.logs
-
-        isPaired_ch = CUTADAPT.out.reads.map{ 
-                                              sample_id, reads, isPaired -> isPaired
-                                              }.first()
-
-        samples_ch = runsheet_ch.first()
-                     .concat(isPaired_ch)
-                     .collate(2)
-        
-        
-        // Run dada2
-        RUN_DADA2(samples_ch, trimmed_reads_ch, trimmed_reads_counts, DOWNLOAD_DATABASE.out.database)
-
-        CUTADAPT.out.version | mix(software_versions_ch) | set{software_versions_ch}
-    }else{
-        raw_reads_ch = staged_reads_ch.map{
-                          sample_id, reads, isPaired -> reads instanceof List ? reads.each{file("${it}")}: file("${reads}")
-                          }.flatten().collect()
-
-        isPaired_ch = staged_reads_ch.map{sample_id, reads, isPaired -> isPaired}.first()
-        samples_ch = runsheet_ch.first()
-                     .concat(isPaired_ch)
-                     .collate(2)
-        
-        // Run dada2 without primer trimming
-        RUN_DADA2(samples_ch, raw_reads_ch, file("NO_FILE"), DOWNLOAD_DATABASE.out.database)
-    }
-
-    dada_counts = RUN_DADA2.out.counts
-    dada_taxonomy = RUN_DADA2.out.taxonomy
-    dada_biom = RUN_DADA2.out.biom
-    filtered_count = RUN_DADA2.out.filtered_count
-
-    filtered_reads_ch = RUN_DADA2.out.reads
-            .flatten()
-            .map { file ->
-                    // derive sample_id from filename
-                    def sample_id
-                    if (file.name.endsWith("${params.assay_suffix}_R1_filtered.fastq.gz")) {
-                            sample_id = file.name.replace("${params.assay_suffix}_R1_filtered.fastq.gz", "")
-                    } else if (file.name.endsWith("${params.assay_suffix}_R2_filtered.fastq.gz")) {
-                            sample_id = file.name.replace("${params.assay_suffix}_R2_filtered.fastq.gz", "")
-                    }
-
-                    tuple(sample_id, file)
-            }
-            .groupTuple(by:0)  // group R1/R2 by sample_id
-            .map { sample_id, files ->
-                    def pathFiles = files.collect { it instanceof String ? file(it) : it }  // ensure Path objects
-                    def isPaired = pathFiles.size() > 1
-                    tuple(sample_id, pathFiles, isPaired)
-            }
-
-    FILTERED_FASTQC(filtered_reads_ch)
-    	filtered_fastqc_files = FILTERED_FASTQC.out.fastqc.flatten().collect()
-
-    FILTERED_MULTIQC("filtered", params.multiqc_config, filtered_fastqc_files)
-
-    RUN_DADA2.out.version | mix(software_versions_ch) | set{software_versions_ch}
-    FILTERED_FASTQC.out.version | mix(software_versions_ch) | set{software_versions_ch}
-    FILTERED_MULTIQC.out.version | mix(software_versions_ch) | set{software_versions_ch}
-
-    // Zip biom file
-    dada_biom
-        .map { biom -> tuple("taxonomy-and-counts", biom) }
-        | ZIP_BIOM
-
-    ZIP_BIOM.out.version | mix(software_versions_ch) | set{software_versions_ch}
-
-
-   
-    // Diversity, differential abundance testing and their corresponding visualizations
-    if(params.accession){
-
-        values = ["samples": "Sample Name",
-                "group" : "groups",
-                "depth" : params.rarefaction_depth,
-                "assay_suffix" : params.assay_suffix,
-                "output_prefix" : params.cleaned_prefix,
-                "target_region" : params.target_region,
-                "library_cutoff" : params.library_cutoff,
-                "prevalence_cutoff" : params.prevalence_cutoff,
-                "rare" : params.remove_rare ? "--remove-rare" : "",
-                "struc_zero": params.remove_struc_zeros ? "--remove-structural-zeros" : ""
-                ]
-        
-        metadata  =  runsheet_ch
-
-    }else{
-
-        values = ["samples": params.samples_column,
-                "group" : params.group,
-                "depth" : params.rarefaction_depth,
-                "assay_suffix" : params.assay_suffix,
-                "output_prefix" : params.cleaned_prefix,
-                "target_region" : params.target_region,
-                "library_cutoff" : params.library_cutoff,
-                "prevalence_cutoff" : params.prevalence_cutoff,
-                "rare" :  params.remove_rare ? "--remove-rare" : "",
-                "struc_zero": params.remove_struc_zeros ? "--remove-structural-zeros" : ""
-                ]
-        
-        metadata  =  ch_input_file
-
-    }
-    meta  = channel.of(values)
-    
-    // Diversity analysis
-    ALPHA_DIVERSITY(meta, dada_counts, dada_taxonomy, metadata)
-    BETA_DIVERSITY(meta, dada_counts, dada_taxonomy, metadata)
-
-    // Zipping diversity plots
-    // Alpha diversity (if rarefaction succeeded)
-    ALPHA_DIVERSITY.out.output_dir
-    	.map { dir ->
-		    def pngs = file(dir).listFiles()?.findAll { it.name.endsWith('.png') }
-        	pngs ? tuple(
-            	"alpha_diversity_plots",
-            	pngs
-        	) : null
-    	}
-    	.filter { it != null }
-    	| ZIP_ALPHA
-
-    // Beta diversity - euclidean distance
-    BETA_DIVERSITY.out.output_dir
-	    .map { dir ->
-		    def pngs = file(dir).listFiles()?.findAll { it.name.contains('euclidean') && it.name.endsWith('.png') }
-        	pngs ? tuple(
-            	"euclidean_distance_plots",
-            	pngs
-        	) : null
-    	}
-	    .filter { it != null }
-        | ZIP_BETA_EUCLIDEAN
-
-    // Beta diversity - bray curtis (if rarefaction succeeded)
-    BETA_DIVERSITY.out.output_dir
-        .map { dir ->
-            def pngs = file(dir).listFiles()?.findAll { it.name.contains('bray') && it.name.endsWith('.png') }
-            pngs ? tuple(
-                "bray_curtis_plots",
-                pngs
-            ) : null
-        }
-        .filter { it != null }
-    	| ZIP_BETA_BRAY
-
-    // Taxonomy plotting
-    PLOT_TAXONOMY(meta, dada_counts, dada_taxonomy, metadata)
-
-    // Zipping taxonomy plots
-   // Sample plots
-    PLOT_TAXONOMY.out.output_dir
-        .map { dir ->
-            def pngs = file(dir).listFiles()?.findAll { it.name.contains('samples') && it.name.endsWith('.png') }
-            pngs ? tuple(
-                "sample_taxonomy_plots",
-                pngs
-            ) : null
-        }
-        .filter { it != null }
-        | ZIP_TAXONOMY_SAMPLES
-
-   // Group taxonomy plots
-    PLOT_TAXONOMY.out.output_dir
-        .map { dir ->
-            def pngs = file(dir).listFiles()?.findAll { it.name.contains('groups') && it.name.endsWith('.png') }
-            pngs ? tuple(
-                "group_taxonomy_plots",
-                pngs
-            ) : null
-        }
-        .filter { it != null }
-        | ZIP_TAXONOMY_GROUPS
-    
-    ALPHA_DIVERSITY.out.version | mix(software_versions_ch) | set{software_versions_ch}
-    BETA_DIVERSITY.out.version | mix(software_versions_ch) | set{software_versions_ch}
-    PLOT_TAXONOMY.out.version | mix(software_versions_ch) | set{software_versions_ch}
-    
-     // Differential abundance testing
-     da_contrasts_ch = channel.empty()
-     da_sampleTable_ch = channel.empty()
-     ancombc1_ch = channel.empty()
-     zip_ancombc1_ch = channel.empty()
-     ancombc2_ch = channel.empty()
-     zip_ancombc2_ch = channel.empty()
-     deseq2_ch = channel.empty()
-     zip_deseq2_ch = channel.empty()
-
-     method = channel.of(params.diff_abund_method)
-     if (params.diff_abund_method == "deseq2"){
-    
-        DESEQ(meta, dada_counts, dada_taxonomy, metadata, filtered_count)
-        deseq2_ch = DESEQ.out.output_dir
-        da_contrasts_ch = DESEQ.out.contrasts_file
-        da_sampleTable_ch = DESEQ.out.sample_table_file
-        DESEQ.out.version | mix(software_versions_ch) | set{software_versions_ch}
-        // Zipping DESeq2 plots
-	    DESEQ.out.output_dir
-		    .map { dir ->
-                def pngs = file(dir).listFiles()?.findAll { it.name.contains('volcano') && it.name.endsWith('.png') }
-                pngs ? tuple(
-                    "deseq2_volcano_plots",
-                    pngs
-                ) : null
-            }
-            .filter { it != null }
-  	        | ZIP_DESEQ2
-        zip_deseq2_ch = ZIP_DESEQ2.out.zip
-    
-    }else if (params.diff_abund_method == "ancombc1"){
-    
-        ANCOMBC1(method, meta, dada_counts, dada_taxonomy, metadata, filtered_count)
-        ancombc1_ch = ANCOMBC1.out.output_dir
-        da_contrasts_ch = ANCOMBC1.out.contrasts_file
-        da_sampleTable_ch = ANCOMBC1.out.sample_table_file
-        ANCOMBC1.out.version | mix(software_versions_ch) | set{software_versions_ch}
-        // Zipping ANCOMBC1 plots
-	    ANCOMBC1.out.output_dir
-            .map { dir ->
-                def pngs = file(dir).listFiles()?.findAll { it.name.contains('volcano') && it.name.endsWith('.png') }
-                pngs ? tuple(
-                    "ancombc1_volcano_plots",
-                    pngs
-                ) : null
-            }
-            .filter { it != null }
-            | ZIP_ANCOMBC1
-        zip_ancombc1_ch = ZIP_ANCOMBC1.out.zip
-
-    }else if (params.diff_abund_method == "ancombc2"){
-
-        ANCOMBC2(method, meta, dada_counts, dada_taxonomy, metadata, filtered_count)
-        ancombc2_ch = ANCOMBC2.out.output_dir
-        da_contrasts_ch = ANCOMBC2.out.contrasts_file
-        da_sampleTable_ch = ANCOMBC2.out.sample_table_file
-        ANCOMBC2.out.version | mix(software_versions_ch) | set{software_versions_ch}
-        // Zipping ANCOMBC2 plots
-	    ANCOMBC2.out.output_dir
-            .map { dir ->
-                def pngs = file(dir).listFiles()?.findAll { it.name.contains('volcano') && it.name.endsWith('.png') }
-                pngs ? tuple(
-                    "ancombc2_volcano_plots",
-                    pngs
-                ) : null
-            }
-            .filter { it != null }
-            | ZIP_ANCOMBC2
-        zip_ancombc2_ch = ZIP_ANCOMBC2.out.zip
-
-    }else{
-
-        ANCOMBC1("ancombc1", meta, dada_counts, dada_taxonomy, metadata, filtered_count)
-        ancombc1_ch = ANCOMBC1.out.output_dir
-        da_contrasts_ch = ANCOMBC1.out.contrasts_file
-        da_sampleTable_ch = ANCOMBC1.out.sample_table_file
-        ANCOMBC1.out.version | mix(software_versions_ch) | set{software_versions_ch}
-
-        ANCOMBC2("ancombc2", meta, dada_counts, dada_taxonomy, metadata, ANCOMBC1.out.output_dir)
-        ancombc2_ch = ANCOMBC2.out.output_dir
-        ANCOMBC2.out.version | mix(software_versions_ch) | set{software_versions_ch}
-
-        DESEQ(meta, dada_counts, dada_taxonomy, metadata, ANCOMBC2.out.output_dir)
-        deseq2_ch = DESEQ.out.output_dir
-        DESEQ.out.version | mix(software_versions_ch) | set{software_versions_ch}
-
-        // Zipping DA plots
-	    //ANCOMBC1
-	    ANCOMBC1.out.output_dir
-            .map { dir ->
-                def pngs = file(dir).listFiles()?.findAll { it.name.contains('volcano') && it.name.endsWith('.png') }
-                pngs ? tuple(
-                    "ancombc1_volcano_plots",
-                    pngs
-                ) : null
-            }
-            .filter { it != null }
-            | ZIP_ANCOMBC1
-        zip_ancombc1_ch = ZIP_ANCOMBC1.out.zip
-	    //ANCOMBC2
-	    ANCOMBC2.out.output_dir
-            .map { dir ->
-                def pngs = file(dir).listFiles()?.findAll { it.name.contains('volcano') && it.name.endsWith('.png') }
-                pngs ? tuple(
-                    "ancombc2_volcano_plots",
-                    pngs
-                ) : null
-            }
-            .filter { it != null }
-            | ZIP_ANCOMBC2
-        zip_ancombc2_ch = ZIP_ANCOMBC2.out.zip
-	    // DESeq2
-	    DESEQ.out.output_dir
-            .map { dir ->
-                def pngs = file(dir).listFiles()?.findAll { it.name.contains('volcano') && it.name.endsWith('.png') }
-                pngs ? tuple(
-                    "deseq2_volcano_plots",
-                    pngs
-                ) : null
-            }
-            .filter { it != null }
-            | ZIP_DESEQ2
-        zip_deseq2_ch = ZIP_DESEQ2.out.zip
-    }
-    
-
-     // Software Version Capturing - combining all captured software versions
-     nf_version = "Nextflow Version ".concat("${nextflow.version}")
-     nextflow_version_ch = channel.value(nf_version)
-
-     //  Write software versions to file
-     software_versions_ch | map { it.text.strip() }
-                          | unique
-                          | mix(nextflow_version_ch)
-                          | collectFile({it -> it}, newLine: true, cache: false)
-                          | SOFTWARE_VERSIONS
-
-    publish:
+publish:
     // Metadata
     runsheet = runsheet_ch
     isa_archive = isa_archive_ch
     gl_file = gl_file_ch
 
+    // Test mode report
+    test_mode_report = params.test_mode ? test_results.report : channel.empty()
+
     // Raw reads
     raw_reads = staged_reads_ch
 
     // Trimmed reads
-    trimmed_reads = trimmed_reads_ch
-    trimmed_count = trimmed_reads_counts
-    cutadapt_logs = cutadapt_logs
+    trimmed_reads = !params.test_mode ? full_results.trimmed_reads : channel.empty()
+    trimmed_count = !params.test_mode ? full_results.trimmed_count : channel.empty()
+    cutadapt_logs = !params.test_mode ? full_results.cutadapt_logs : channel.empty()
     
     // Filtered reads
-    filtered_reads = filtered_reads_ch
-    filtered_count = filtered_count
+    filtered_reads = !params.test_mode ? full_results.filtered_reads : channel.empty()
+    filtered_count = !params.test_mode ? full_results.filtered_count : channel.empty()
 
     // FastQC
     raw_fastqc = RAW_FASTQC.out.fastqc
-    filtered_fastqc = FILTERED_FASTQC.out.fastqc
+    filtered_fastqc = !params.test_mode ? full_results.filtered_fastqc : channel.empty()
 
     // MultiQC
     zip_multiqc_raw = RAW_MULTIQC.out.zipped_data
     html_multiqc_raw = RAW_MULTIQC.out.html
-    zip_multiqc_filtered = FILTERED_MULTIQC.out.zipped_data
-    html_multiqc_filtered = FILTERED_MULTIQC.out.html
+    zip_multiqc_filtered = !params.test_mode ? full_results.zip_multiqc_filtered : channel.empty()
+    html_multiqc_filtered = !params.test_mode ? full_results.html_multiqc_filtered : channel.empty()
 
     // Dada2 outputs
-    asv = RUN_DADA2.out.fasta
-    counts = RUN_DADA2.out.counts
-    taxonomy = RUN_DADA2.out.taxonomy
-    taxonomy_counts = RUN_DADA2.out.taxonomy_count
-    biom_zip = ZIP_BIOM.out.zip
-    read_count_tracking = RUN_DADA2.out.read_count
+    asv = !params.test_mode ? full_results.asv : channel.empty()
+    counts = !params.test_mode ? full_results.counts : channel.empty()
+    taxonomy = !params.test_mode ? full_results.taxonomy : channel.empty()
+    taxonomy_counts = !params.test_mode ? full_results.taxonomy_counts : channel.empty()
+    biom_zip = !params.test_mode ? full_results.biom_zip : channel.empty()
+    read_count_tracking = !params.test_mode ? full_results.read_count_tracking : channel.empty()
 
     // Alpha and beta diversity outputs
-    alpha_diversity = ALPHA_DIVERSITY.out.output_dir
-    zip_alpha_plots = ZIP_ALPHA.out.zip
-    beta_diversity = BETA_DIVERSITY.out.output_dir
-    zip_beta_euclidean_plots = ZIP_BETA_EUCLIDEAN.out.zip
-    zip_beta_bray_plots = ZIP_BETA_BRAY.out.zip
+    alpha_diversity = !params.test_mode ? full_results.alpha_diversity : channel.empty()
+    zip_alpha_plots = !params.test_mode ? full_results.zip_alpha_plots : channel.empty()
+    beta_diversity = !params.test_mode ? full_results.beta_diversity : channel.empty()
+    zip_beta_euclidean_plots = !params.test_mode ? full_results.zip_beta_euclidean_plots : channel.empty()
+    zip_beta_bray_plots = !params.test_mode ? full_results.zip_beta_bray_plots : channel.empty()
 
     // Taxonomy plots
-    taxonomy_plots = PLOT_TAXONOMY.out.output_dir
-    zip_taxonomy_samples = ZIP_TAXONOMY_SAMPLES.out.zip
-    zip_taxonomy_groups = ZIP_TAXONOMY_GROUPS.out.zip
+    taxonomy_plots = !params.test_mode ? full_results.taxonomy_plots : channel.empty()
+    zip_taxonomy_samples = !params.test_mode ? full_results.zip_taxonomy_samples : channel.empty()
+    zip_taxonomy_groups = !params.test_mode ? full_results.zip_taxonomy_groups : channel.empty()
 
     // Differential abundance outputs
-    da_contrasts = da_contrasts_ch
-    da_sampleTable = da_sampleTable_ch
-    ancombc1 = ancombc1_ch
-    zip_ancombc1 = zip_ancombc1_ch
-    ancombc2 = ancombc2_ch
-    zip_ancombc2 = zip_ancombc2_ch
-    deseq2 = deseq2_ch
-    zip_deseq2 = zip_deseq2_ch
+    da_contrasts = !params.test_mode ? full_results.da_contrasts : channel.empty()
+    da_sampleTable = !params.test_mode ? full_results.da_sampleTable : channel.empty()
+    ancombc1 = !params.test_mode ? full_results.ancombc1 : channel.empty()
+    zip_ancombc1 = !params.test_mode ? full_results.zip_ancombc1 : channel.empty()
+    ancombc2 = !params.test_mode ? full_results.ancombc2 : channel.empty()
+    zip_ancombc2 = !params.test_mode ? full_results.zip_ancombc2 : channel.empty()
+    deseq2 = !params.test_mode ? full_results.deseq2 : channel.empty()
+    zip_deseq2 = !params.test_mode ? full_results.zip_deseq2 : channel.empty()
 
     // GeneLab
-    software_versions = SOFTWARE_VERSIONS.out.software_versions_txt
+    software_versions = !params.test_mode ? full_results.software_versions : channel.empty()
 
 }
 
@@ -594,6 +290,9 @@ output {
     runsheet { path "Metadata" }
     isa_archive { path "Metadata" }
     gl_file { path "Metadata" }
+
+    // Test mode report
+    test_mode_report { path "Test_Mode_Report" }
 
     // Raw reads
     raw_reads { path "Raw_Sequence_Data" }

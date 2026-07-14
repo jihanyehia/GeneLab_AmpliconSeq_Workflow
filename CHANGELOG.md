@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Option to run workflow in accession mode using a local ISA archive (`--isa_archive` parameter)
+- `test_mode` execution path (`--test_mode`) for rapid pre-production parameter assessment with configurable `--test_level` options (`primers`, `filter`, `full`) and test-mode HTML summary report output at `Test_Mode_Report/test_mode_report.html`
 - Caching support for reference databases to avoid redundant downloads on repeated runs of the main workflow
 - A Bioconductor package (microbiome 1.32.0) that is required by ANCOMBC >= 2.12
 - Support for `--primers-already-trimmed` behavior in the post-processing workflow by adding `trim_primers` parameter to control inclusion of trimmed-data-related information across its processes
@@ -18,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 ### Changed
+- Main workflow routing now branches after shared staging and raw QC into either `TEST_MODE` or `PRODUCTION_MODE`
 - Migrated output handling to Nextflow `workflow output {}` block in both main and post-processing workflows; removed deprecated suffix and directory parameters from `nextflow.config` and `post_processing.config`
 - Switched output files under `Metadata/` and `GeneLab/` to comply with other GeneLab workflows
 - Replaced `GET_RUNSHEET` process and associated workflow logic with a new staging analysis subworkflow supporting both accession-based and input-file-based execution modes
