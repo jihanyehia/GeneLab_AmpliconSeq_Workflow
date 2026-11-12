@@ -11,7 +11,7 @@ process DOWNLOAD_DATABASE {
         
     script:        
         """
-        wget --user-agent="Mozilla/5.0" ${url} -O ${db_name} || exit 1
+        wget ${url} -O ${db_name} || exit 1
         chmod 664 ${db_name}
 
         ls -la ${db_name}
